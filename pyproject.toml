@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "uncomms"
+version = "0.1.0"
+description = "Decentralized, censorship-resistant chat via consensus protocol"
+requires-python = ">=3.10"
+dependencies = ["PyNaCl>=1.5.0"]
+
+[project.scripts]
+uncomms = "uncomms.__main__:main"
