@@ -1,4 +1,4 @@
-"""Async TCP mesh networking with gossip and sync."""
+"""Async TCP mesh networking with gossip, sync, and NAT traversal."""
 
 from __future__ import annotations
 
@@ -18,6 +18,11 @@ from .protocol import (
 from .store import MessageStore
 
 log = logging.getLogger(__name__)
+
+# NAT traversal constants
+PUNCH_ATTEMPTS = 4
+PUNCH_INTERVAL = 0.5  # seconds between attempts
+PUNCH_TIMEOUT = 3.0   # total timeout for hole-punch sequence
 
 
 @dataclass
@@ -71,6 +76,12 @@ class PeerNetwork:
         self.actual_port: int = 0  # filled after start()
         self.server_ids: list[str] = []  # servers we participate in
 
+        # NAT traversal state
+        self._relay_only_peers: set[str] = set()  # pubkeys reachable only via relay
+        self._bootstrap_reader: asyncio.StreamReader | None = None
+        self._bootstrap_writer: asyncio.StreamWriter | None = None
+        self._punch_events: dict[str, asyncio.Event] = {}  # pubkey -> event
+
     # -- lifecycle -------------------------------------------------------------
 
     async def start(self) -> None:
@@ -88,6 +99,14 @@ class PeerNetwork:
         if self._server:
             self._server.close()
             await self._server.wait_closed()
+        # Close bootstrap connection
+        if self._bootstrap_writer:
+            try:
+                self._bootstrap_writer.close()
+            except Exception:
+                pass
+            self._bootstrap_writer = None
+            self._bootstrap_reader = None
 
     # -- outbound connections --------------------------------------------------
 
@@ -141,6 +160,8 @@ class PeerNetwork:
             return True  # already connected
 
         self.peers[peer.pubkey] = peer
+        # No longer relay-only if we got a direct connection
+        self._relay_only_peers.discard(peer.pubkey)
         log.info("Connected to %s (%s)", peer.display_name, peer.pubkey[:8])
 
         if self.on_peer_update:
@@ -211,6 +232,7 @@ class PeerNetwork:
             return
 
         self.peers[peer.pubkey] = peer
+        self._relay_only_peers.discard(peer.pubkey)
         log.info("Inbound peer: %s (%s)", peer.display_name, peer.pubkey[:8])
 
         if self.on_peer_update:
@@ -249,6 +271,8 @@ class PeerNetwork:
             asyncio.ensure_future(self._connect_new_peers(env.payload.get("peers", [])))
         elif env.msg_type == MsgType.SERVER_INFO:
             await self._handle_server_info(env, sender)
+        elif env.msg_type == MsgType.RELAY:
+            await self._handle_relay(env, sender)
 
     # -- gossip ----------------------------------------------------------------
 
@@ -285,6 +309,13 @@ class PeerNetwork:
             sender_pubkey=self.identity.pubkey_hex,
         )
         await self._broadcast(env)
+
+        # Also send through bootstrap relay for relay-only peers
+        if self._relay_only_peers and self._bootstrap_writer:
+            try:
+                await write_envelope(self._bootstrap_writer, env)
+            except Exception:
+                log.debug("Failed to relay message through bootstrap")
 
     async def _broadcast(self, env: Envelope, exclude: str = "") -> None:
         for pk, peer in list(self.peers.items()):
@@ -360,6 +391,188 @@ class PeerNetwork:
         if sid not in self.server_ids:
             self.server_ids.append(sid)
 
+    # -- Layer 1: TCP hole punching --------------------------------------------
+
+    async def _attempt_hole_punch(
+        self, target_pubkey: str, bs_host: str, bs_port: int
+    ) -> bool:
+        """Request the bootstrap server to coordinate a hole punch."""
+        if not self._bootstrap_writer:
+            return False
+
+        # Send PUNCH_REQUEST through persistent bootstrap connection
+        req = Envelope(
+            msg_type=MsgType.PUNCH_REQUEST,
+            payload={"target_pubkey": target_pubkey},
+            sender_pubkey=self.identity.pubkey_hex,
+        )
+        try:
+            await write_envelope(self._bootstrap_writer, req)
+        except Exception:
+            return False
+
+        # Wait for the PUNCH_NOTIFY to arrive (handled by bootstrap read loop)
+        # and for the resulting connection attempt to succeed
+        event = asyncio.Event()
+        self._punch_events[target_pubkey] = event
+        try:
+            await asyncio.wait_for(event.wait(), timeout=PUNCH_TIMEOUT)
+            return target_pubkey in self.peers
+        except asyncio.TimeoutError:
+            return False
+        finally:
+            self._punch_events.pop(target_pubkey, None)
+
+    async def _handle_punch_notify(self, env: Envelope) -> None:
+        """Handle PUNCH_NOTIFY from bootstrap: try to connect to the peer."""
+        from_pubkey = env.payload.get("from_pubkey", "")
+        addr = env.payload.get("public_addr", {})
+        host = addr.get("host", "")
+        port = addr.get("port", 0)
+
+        if not host or not port or from_pubkey in self.peers:
+            # Already connected or bad data — signal success
+            event = self._punch_events.get(from_pubkey)
+            if event:
+                event.set()
+            return
+
+        log.debug("Punch notify: attempting %d connections to %s:%d", PUNCH_ATTEMPTS, host, port)
+
+        # Make multiple rapid connection attempts (simultaneous open)
+        tasks = []
+        for i in range(PUNCH_ATTEMPTS):
+            tasks.append(self._punch_connect(host, port, delay=i * PUNCH_INTERVAL))
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        success = any(r is True for r in results)
+
+        if success:
+            log.info("Hole punch to %s succeeded", from_pubkey[:8])
+        else:
+            log.debug("Hole punch to %s:%d failed", host, port)
+
+        # Signal any waiting _attempt_hole_punch call
+        event = self._punch_events.get(from_pubkey)
+        if event:
+            event.set()
+
+    async def _punch_connect(self, host: str, port: int, delay: float = 0) -> bool:
+        """Single hole-punch connection attempt with optional delay."""
+        if delay > 0:
+            await asyncio.sleep(delay)
+        return await self.connect_to_peer(host, port)
+
+    # -- Layer 2: Relay through peers ------------------------------------------
+
+    async def send_via_relay(self, target_pubkey: str, envelope: Envelope) -> bool:
+        """Try to reach target through any connected peer that knows them."""
+        relay_env = Envelope(
+            msg_type=MsgType.RELAY,
+            payload={
+                "target": target_pubkey,
+                "inner": {
+                    "type": envelope.msg_type.value,
+                    "payload": envelope.payload,
+                    "sender": envelope.sender_pubkey,
+                },
+            },
+            sender_pubkey=self.identity.pubkey_hex,
+        )
+        for peer in self.peers.values():
+            if peer.connected:
+                await peer.send(relay_env)
+                return True
+        return False
+
+    async def _handle_relay(self, env: Envelope, sender: PeerConnection) -> None:
+        """Forward a relayed envelope to its target if we're connected to them."""
+        target_pubkey = env.payload.get("target", "")
+        inner_data = env.payload.get("inner", {})
+
+        if not target_pubkey or not inner_data:
+            return
+
+        # If we are the target, process the inner envelope directly
+        if target_pubkey == self.identity.pubkey_hex:
+            try:
+                inner_env = Envelope(
+                    msg_type=MsgType(inner_data["type"]),
+                    payload=inner_data.get("payload", {}),
+                    sender_pubkey=inner_data.get("sender", ""),
+                )
+                await self._handle_envelope(inner_env, sender)
+            except (KeyError, ValueError):
+                log.debug("Invalid inner envelope in relay")
+            return
+
+        # Otherwise forward to target if directly connected (single-hop only)
+        target_peer = self.peers.get(target_pubkey)
+        if target_peer and target_peer.connected:
+            try:
+                inner_env = Envelope(
+                    msg_type=MsgType(inner_data["type"]),
+                    payload=inner_data.get("payload", {}),
+                    sender_pubkey=inner_data.get("sender", ""),
+                )
+                await target_peer.send(inner_env)
+            except (KeyError, ValueError):
+                log.debug("Invalid inner envelope in relay")
+        else:
+            log.debug("Relay target %s not directly connected, dropping", target_pubkey[:8])
+
+    # -- Layer 3: Bootstrap relay helpers --------------------------------------
+
+    async def send_via_bootstrap(self, envelope: Envelope) -> bool:
+        """Send an envelope through the bootstrap server's relay."""
+        if not self._bootstrap_writer:
+            return False
+        try:
+            await write_envelope(self._bootstrap_writer, envelope)
+            return True
+        except Exception:
+            log.debug("Failed to send via bootstrap relay")
+            return False
+
+    # -- Combined reachability -------------------------------------------------
+
+    async def ensure_reachability(
+        self,
+        target_pubkey: str,
+        hint_host: str,
+        hint_port: int,
+        bs_host: str = "",
+        bs_port: int = 0,
+    ) -> bool:
+        """Try to reach a peer through the three-layer NAT traversal strategy.
+
+        Layer 1: Direct TCP connect
+        Layer 2: Hole punch via bootstrap
+        Layer 3 & 4: Relay (implicit through gossip and bootstrap forwarding)
+        """
+        # Already connected?
+        if target_pubkey in self.peers:
+            return True
+
+        # Layer 1: direct TCP connect
+        if hint_host and hint_port:
+            if await self.connect_to_peer(hint_host, hint_port):
+                return True
+
+        # Layer 2: hole punch via bootstrap
+        if bs_host and bs_port and self._bootstrap_writer:
+            if await self._attempt_hole_punch(target_pubkey, bs_host, bs_port):
+                return True
+
+        # Layer 3 & 4: relay is implicit — gossip and bootstrap forwarding
+        # handle it. Mark this peer as "relay-only".
+        self._relay_only_peers.add(target_pubkey)
+        log.info(
+            "Peer %s marked as relay-only (no direct connection)",
+            target_pubkey[:8],
+        )
+        return True  # reachable, just not directly
+
     # -- peer discovery --------------------------------------------------------
 
     async def _connect_new_peers(self, peer_list: list[dict]) -> None:
@@ -380,6 +593,7 @@ class PeerNetwork:
                 "host": p.host,
                 "port": p.port,
                 "connected": p.connected,
+                "relay_only": p.pubkey in self._relay_only_peers,
             }
             for p in self.peers.values()
         ]

@@ -28,6 +28,10 @@ class MsgType(str, Enum):
     DISCOVER_RESPONSE = "discover_resp"
     # Server management
     SERVER_INFO = "server_info"
+    # NAT traversal
+    PUNCH_REQUEST = "punch_req"    # client → bootstrap: request hole punch
+    PUNCH_NOTIFY = "punch_notify"  # bootstrap → client: punch notification
+    RELAY = "relay"                # peer → peer: relay envelope to another peer
 
 
 @dataclass
