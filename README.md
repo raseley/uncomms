@@ -1,6 +1,6 @@
 # Uncomms
 
-Decentralized, censorship-resistant chat. A minimalist Discord clone where each server is a peer-to-peer mesh of its members — no central authority, no single point of control.
+Decentralized, censorship-resistant, end-to-end encrypted chat. A minimalist Discord clone where each server is a peer-to-peer mesh of its members — no central authority, no single point of control.
 
 ## How it works
 
@@ -8,6 +8,8 @@ Every participant runs a node. Nodes connect directly to each other over TCP, fo
 
 This makes censorship, tampering, and omission **detectable by every participant**:
 
+- **End-to-end encryption** — Message content is encrypted with a per-server key. Non-members who relay gossip see only ciphertext.
+- **Forward-secret transport** — Every peer connection uses ephemeral X25519 key exchange. Compromising a past session key reveals nothing.
 - **Tamper evidence** — Altering any message breaks the hashchain from that point forward. Every peer can detect this.
 - **Omission detection** — During sync, nodes compare histories. Missing messages are fetched from any peer that has them. One honest node is enough.
 - **Signature non-repudiation** — Every message is Ed25519-signed. Authorship is unforgeable and undeniable.
@@ -88,16 +90,16 @@ Alice creates a server with `/create myserver`. Bob and Charlie join with `/join
 
 | Module | Responsibility |
 |--------|---------------|
-| `identity.py` | Ed25519 key generation, signing, verification |
-| `message.py` | Message model, canonical hashing, hashchain linking |
+| `identity.py` | Ed25519 key generation, signing, verification, Curve25519 conversion, encrypted keyring |
+| `message.py` | Message model, canonical hashing, hashchain linking, message encryption/decryption |
 | `store.py` | SQLite append-only persistence (WAL mode) |
 | `consensus.py` | Chain validation, fork resolution, censorship detection |
-| `protocol.py` | Length-prefixed JSON wire protocol |
-| `network.py` | Async TCP mesh, gossip broadcast, sync, NAT traversal |
+| `protocol.py` | Length-prefixed wire protocol, `EncryptedChannel` for transport encryption |
+| `network.py` | Async TCP mesh, gossip broadcast, sync, NAT traversal, ephemeral key exchange |
 | `bootstrap.py` | Rendezvous server, hole-punch coordination, relay |
-| `server.py` | Server and channel management |
-| `node.py` | Main orchestrator |
-| `ui.py` | Curses terminal interface |
+| `server.py` | Server and channel management, server key generation |
+| `node.py` | Main orchestrator, keyring management, key exchange on join |
+| `ui.py` | Curses terminal interface with encryption indicators |
 
 ### Message format
 
@@ -110,31 +112,98 @@ Every message contains:
 | `channel` | Channel name |
 | `author_pubkey` | 32-byte Ed25519 public key |
 | `author_name` | Display name |
-| `content` | Message text |
+| `content` | Message text (plaintext or encrypted ciphertext) |
 | `timestamp` | Unix timestamp |
 | `prev_hash` | Hash of previous message in channel (genesis: `"0"*64`) |
 | `signature` | 64-byte Ed25519 signature over canonical bytes |
+| `encrypted` | Boolean flag indicating content is encrypted (metadata only, not in canonical bytes) |
 
 The `prev_hash` field forms the hashchain. If two messages reference the same parent (concurrent sends / fork), both are accepted and ordered deterministically by `(timestamp, message_id)` — all nodes converge to the same order.
 
+When message encryption is active, the `content` field stores hex-encoded ciphertext. The hashchain and signatures cover ciphertext, so chain integrity is verifiable by any node — but content is readable only by members who hold the server key.
+
 ### Wire protocol
 
-Messages between peers use length-prefixed JSON framing:
+Messages between peers use length-prefixed JSON framing. Before the handshake completes:
 
 ```
 [4-byte big-endian uint32 length][JSON payload]
 ```
 
-Protocol message types: `HELLO`, `HELLO_ACK`, `NEW_MESSAGE`, `SYNC_REQUEST`, `SYNC_RESPONSE`, `PEER_LIST`, `REGISTER`, `DISCOVER`, `DISCOVER_RESPONSE`, `SERVER_INFO`, `PUNCH_REQUEST`, `PUNCH_NOTIFY`, `RELAY`.
+After the `HELLO`/`HELLO_ACK` handshake, all subsequent frames are encrypted:
+
+```
+[4-byte length][24-byte nonce][ciphertext + 16-byte Poly1305 tag]
+```
+
+Protocol message types: `HELLO`, `HELLO_ACK`, `NEW_MESSAGE`, `SYNC_REQUEST`, `SYNC_RESPONSE`, `PEER_LIST`, `REGISTER`, `DISCOVER`, `DISCOVER_RESPONSE`, `SERVER_INFO`, `PUNCH_REQUEST`, `PUNCH_NOTIFY`, `RELAY`, `KEY_EXCHANGE`.
 
 ### Data flow
 
 1. User types a message in the UI
-2. Node creates a `Message`, signs it, computes hash, links to chain head
-3. Message is stored locally in SQLite
-4. Message is gossiped to all connected peers
-5. Each peer validates (signature + hash), stores, re-gossips to its peers
+2. Node encrypts content with the server key (if available), then signs and hashes
+3. Message is stored locally in SQLite (ciphertext)
+4. Message is gossiped to all connected peers over the encrypted transport
+5. Each peer validates (signature + hash over ciphertext), stores, re-gossips
 6. Any node connecting later syncs the full history from peers
+7. Members decrypt content for display; non-members see only ciphertext
+
+## Encryption
+
+Uncomms uses two independent encryption layers, each solving a distinct problem:
+
+| Layer | Protects against | Scope |
+|-------|-----------------|-------|
+| **Transport** | Network eavesdroppers, ISPs, middle boxes | Per-TCP-connection |
+| **Message** | Compromised nodes, disk forensics, unauthorized readers | Per-server, at rest + in transit |
+
+Both layers use primitives from PyNaCl (libsodium). No additional dependencies.
+
+### Transport encryption
+
+Every peer connection is encrypted after the `HELLO`/`HELLO_ACK` handshake using an ephemeral X25519 key exchange:
+
+```
+Alice                                          Bob
+  |  HELLO { ..., ephemeral_pk: A_eph }          |
+  |─────────────────────────────────────────────>|
+  |  HELLO_ACK { ..., ephemeral_pk: B_eph }      |
+  |<─────────────────────────────────────────────|
+  |                                              |
+  |  shared = X25519(A_eph_sk, B_eph)            |
+  |  tx_key, rx_key = blake2b(shared, A_pk, B_pk)|
+  |                                              |
+  |  ══════ All subsequent frames encrypted ═════|
+```
+
+- Directional keys — each side encrypts with a different key, derived by sorting static public keys lexicographically
+- XSalsa20-Poly1305 with monotonic 24-byte nonces (uint192, big-endian)
+- Ephemeral keys are discarded on disconnect — **forward secrecy** per connection
+
+### Message encryption
+
+Message content is encrypted with a 32-byte symmetric **server key** before signing. The hashchain covers ciphertext, so chain integrity is verifiable by anyone — but content is readable only by key holders.
+
+```
+plaintext "Hello!" → SecretBox(server_key).encrypt() → hex ciphertext
+    → canonical_bytes(server_id, channel, author, ciphertext, ts, prev_hash)
+    → SHA-256 hash + Ed25519 signature
+```
+
+- **Server key generation**: A random 32-byte key is created with each new server
+- **Key distribution**: When a peer joins, existing members send a `KEY_EXCHANGE` message containing the server key encrypted with NaCl Box (Ed25519→Curve25519 authenticated encryption)
+- **Key storage**: Server keys are stored in `~/.uncomms/keyring.enc`, encrypted with a key derived from the Ed25519 private key via blake2b
+
+### Security properties
+
+| Property | How |
+|----------|-----|
+| Confidentiality in transit | XSalsa20-Poly1305 with ephemeral DH per connection |
+| Forward secrecy | Ephemeral X25519 keys, discarded on disconnect |
+| Confidentiality at rest | Message content encrypted with server key |
+| Tamper evidence | Hashchain + Ed25519 signatures over ciphertext |
+| Authenticated key exchange | Static Ed25519 identities bind ephemeral keys to known peers |
+| Replay protection | Monotonic nonces per connection; message dedup via `_seen_ids` |
 
 ## Bootstrap server
 
@@ -222,7 +291,7 @@ This is exposed through a single method: `PeerNetwork.ensure_reachability()`. Pe
 
 ## Dependencies
 
-**One external dependency**: [PyNaCl](https://pynacl.readthedocs.io/) (libsodium bindings for Ed25519 signatures).
+**One external dependency**: [PyNaCl](https://pynacl.readthedocs.io/) (libsodium bindings for Ed25519 signatures, X25519 key exchange, XSalsa20-Poly1305 symmetric encryption, and blake2b hashing).
 
 Everything else is Python 3.10+ stdlib: `asyncio`, `sqlite3`, `hashlib`, `curses`, `json`, `struct`, `argparse`, `dataclasses`, `pathlib`, `threading`, `queue`.
 
@@ -233,11 +302,13 @@ pip install pytest
 python -m pytest tests/ -v
 ```
 
-43 tests covering identity, message model, SQLite store, wire protocol, consensus validation, multi-node integration (gossip propagation, 3-node relay, sync-on-connect), and NAT traversal (hole-punch coordination, peer relay, bootstrap relay, ensure_reachability).
+66 tests covering identity, message model, SQLite store, wire protocol, consensus validation, multi-node integration (gossip propagation, 3-node relay, sync-on-connect), NAT traversal (hole-punch coordination, peer relay, bootstrap relay, ensure_reachability), and encryption (transport key derivation, encrypted channel roundtrips, message encryption/decryption, keyring persistence, key exchange, encrypted transport between nodes).
 
 ## Limitations
 
-- **No encryption in transit** — messages are signed but not encrypted on the wire. For production use, wrap connections in TLS.
+- **Server key compromise** — exposes all past and future messages in that server. Mitigation: key rotation (future work).
+- **No per-message encryption** — all members share a single server key rather than a Signal-style ratchet. This matches the access model: if you're in the server, you can read everything.
+- **Metadata visibility** — who talks to whom, when, and message sizes are visible to transport-layer observers even with encryption. Padding and traffic shaping are out of scope.
 - **No access control** — anyone who knows a server ID can join. This is by design for censorship resistance, but means servers are public.
 - **Full replication** — every node stores the complete history. Fine for chat-scale data, not for file sharing.
 - **No message deletion** — append-only by design. Once sent, a message exists on every node permanently.
