@@ -153,9 +153,77 @@ class Node:
 
         while True:
             try:
+                await self._bootstrap_session(bs_host, bs_port)
+            except Exception as exc:
+                log.debug("Bootstrap session error: %s", exc)
+                # Clean up stale bootstrap connection
+                self.network._bootstrap_reader = None
+                self.network._bootstrap_writer = None
+
+            # Reconnect after disconnect or error
+            await asyncio.sleep(10)
+
+    async def _bootstrap_session(self, bs_host: str, bs_port: int) -> None:
+        """Maintain a persistent connection to the bootstrap server.
+
+        Handles REGISTER, DISCOVER, and incoming PUNCH_NOTIFY/relay messages.
+        """
+        from .protocol import Envelope, MsgType, read_envelope, write_envelope
+
+        reader, writer = await asyncio.open_connection(bs_host, bs_port)
+
+        # First message must be REGISTER to establish persistent connection
+        sids = list(self.server_mgr.servers.keys())
+        first_sid = sids[0] if sids else ""
+        reg = Envelope(
+            msg_type=MsgType.REGISTER,
+            payload={
+                "server_id": first_sid,
+                "host": self.config.listen_host,
+                "port": self.network.actual_port,
+            },
+            sender_pubkey=self.identity.pubkey_hex,
+        )
+        await write_envelope(writer, reg)
+
+        # Store the persistent connection on the network object
+        self.network._bootstrap_reader = reader
+        self.network._bootstrap_writer = writer
+
+        # Register additional server_ids
+        for sid in sids[1:]:
+            extra_reg = Envelope(
+                msg_type=MsgType.REGISTER,
+                payload={
+                    "server_id": sid,
+                    "host": self.config.listen_host,
+                    "port": self.network.actual_port,
+                },
+                sender_pubkey=self.identity.pubkey_hex,
+            )
+            await write_envelope(writer, extra_reg)
+
+        # Start background reader for incoming bootstrap messages
+        read_task = asyncio.ensure_future(
+            self._bootstrap_read_loop(reader, bs_host, bs_port)
+        )
+
+        # Periodic discover + re-register loop
+        try:
+            while True:
                 for sid in list(self.server_mgr.servers.keys()):
-                    # Register
-                    reader, writer = await asyncio.open_connection(bs_host, bs_port)
+                    # Discover peers over the persistent connection
+                    disc = Envelope(
+                        msg_type=MsgType.DISCOVER,
+                        payload={"server_id": sid},
+                        sender_pubkey=self.identity.pubkey_hex,
+                    )
+                    await write_envelope(writer, disc)
+
+                await asyncio.sleep(120)
+
+                # Re-register (keepalive) for all servers
+                for sid in list(self.server_mgr.servers.keys()):
                     reg = Envelope(
                         msg_type=MsgType.REGISTER,
                         payload={
@@ -166,25 +234,62 @@ class Node:
                         sender_pubkey=self.identity.pubkey_hex,
                     )
                     await write_envelope(writer, reg)
-                    writer.close()
+        finally:
+            read_task.cancel()
+            try:
+                writer.close()
+            except Exception:
+                pass
+            self.network._bootstrap_reader = None
+            self.network._bootstrap_writer = None
 
-                    # Discover peers
-                    reader, writer = await asyncio.open_connection(bs_host, bs_port)
-                    disc = Envelope(
-                        msg_type=MsgType.DISCOVER,
-                        payload={"server_id": sid},
-                        sender_pubkey=self.identity.pubkey_hex,
-                    )
-                    await write_envelope(writer, disc)
-                    resp = await read_envelope(reader)
-                    writer.close()
+    async def _bootstrap_read_loop(
+        self,
+        reader: asyncio.StreamReader,
+        bs_host: str,
+        bs_port: int,
+    ) -> None:
+        """Read messages pushed by the bootstrap server (PUNCH_NOTIFY,
+        DISCOVER_RESPONSE, relayed messages)."""
+        from .protocol import Envelope, MsgType, read_envelope
 
-                    if resp and resp.msg_type == MsgType.DISCOVER_RESPONSE:
-                        for p in resp.payload.get("peers", []):
-                            h, pt = p["host"], p["port"]
-                            if pt != self.network.actual_port:
-                                await self.network.connect_to_peer(h, pt)
-            except Exception as exc:
-                log.debug("Bootstrap error: %s", exc)
+        while True:
+            env = await read_envelope(reader)
+            if env is None:
+                break
 
-            await asyncio.sleep(120)
+            if env.msg_type == MsgType.DISCOVER_RESPONSE:
+                for p in env.payload.get("peers", []):
+                    h, pt = p["host"], p["port"]
+                    pk = p.get("pubkey", "")
+                    if pt != self.network.actual_port:
+                        if pk:
+                            await self.network.ensure_reachability(
+                                pk, h, pt, bs_host, bs_port
+                            )
+                        else:
+                            await self.network.connect_to_peer(h, pt)
+
+            elif env.msg_type == MsgType.PUNCH_NOTIFY:
+                await self.network._handle_punch_notify(env)
+
+            elif env.msg_type == MsgType.NEW_MESSAGE:
+                # Relayed message from bootstrap — process like a peer message
+                # Create a dummy sender for the handler
+                from .network import PeerConnection
+                import io
+                dummy = PeerConnection(
+                    reader=asyncio.StreamReader(),
+                    writer=None,  # type: ignore[arg-type]
+                    pubkey=env.sender_pubkey,
+                )
+                await self.network._handle_new_message(env, dummy)
+
+            elif env.msg_type == MsgType.SYNC_RESPONSE:
+                from .network import PeerConnection
+                dummy = PeerConnection(
+                    reader=asyncio.StreamReader(),
+                    writer=None,  # type: ignore[arg-type]
+                    pubkey=env.sender_pubkey,
+                )
+                await self.network._handle_sync_response(env, dummy)
