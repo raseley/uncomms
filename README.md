@@ -93,8 +93,8 @@ Alice creates a server with `/create myserver`. Bob and Charlie join with `/join
 | `store.py` | SQLite append-only persistence (WAL mode) |
 | `consensus.py` | Chain validation, fork resolution, censorship detection |
 | `protocol.py` | Length-prefixed JSON wire protocol |
-| `network.py` | Async TCP mesh, gossip broadcast, sync |
-| `bootstrap.py` | Optional rendezvous server for peer discovery |
+| `network.py` | Async TCP mesh, gossip broadcast, sync, NAT traversal |
+| `bootstrap.py` | Rendezvous server, hole-punch coordination, relay |
 | `server.py` | Server and channel management |
 | `node.py` | Main orchestrator |
 | `ui.py` | Curses terminal interface |
@@ -125,7 +125,7 @@ Messages between peers use length-prefixed JSON framing:
 [4-byte big-endian uint32 length][JSON payload]
 ```
 
-Protocol message types: `HELLO`, `HELLO_ACK`, `NEW_MESSAGE`, `SYNC_REQUEST`, `SYNC_RESPONSE`, `PEER_LIST`, `REGISTER`, `DISCOVER`, `DISCOVER_RESPONSE`, `SERVER_INFO`.
+Protocol message types: `HELLO`, `HELLO_ACK`, `NEW_MESSAGE`, `SYNC_REQUEST`, `SYNC_RESPONSE`, `PEER_LIST`, `REGISTER`, `DISCOVER`, `DISCOVER_RESPONSE`, `SERVER_INFO`, `PUNCH_REQUEST`, `PUNCH_NOTIFY`, `RELAY`.
 
 ### Data flow
 
@@ -148,7 +148,77 @@ python -m uncomms --serve-bootstrap --port 9999
 python -m uncomms --port 8001 --name Alice --bootstrap localhost:9999
 ```
 
-The bootstrap server is stateless — it keeps an in-memory registry of `(server_id, host, port)` with 5-minute expiry. It stores no messages and is entirely optional. Peers can always connect directly with `--peer`.
+The bootstrap server keeps an in-memory registry of `(server_id, host, port)` with 5-minute expiry. It stores no messages and is entirely optional. Peers can always connect directly with `--peer`.
+
+When a node connects with `--bootstrap`, it maintains a **persistent TCP connection** to the bootstrap server. This enables NAT traversal (see below) and serves as a relay of last resort.
+
+## NAT traversal
+
+Nodes behind NAT can participate in the mesh through a three-layer strategy, tried in order:
+
+### Layer 1 — TCP hole punching
+
+Two NATed peers coordinate timing through the bootstrap server. Both attempt outbound TCP connections to each other's observed public address simultaneously. The bootstrap server observes each node's public IP from the inbound TCP connection and brokers the introduction:
+
+```
+Node A ──TCP──► Bootstrap: REGISTER (bootstrap observes A's public endpoint)
+Node B ──TCP──► Bootstrap: PUNCH_REQUEST {target: A}
+Bootstrap ──►  A: PUNCH_NOTIFY {from: B, public_addr: B's observed address}
+
+Both sides simultaneously:
+  A tries connect() to B's public_addr  (4 attempts, 0.5s apart)
+  B tries connect() to A's public_addr  (4 attempts, 0.5s apart)
+
+First successful connection → normal HELLO handshake → done
+```
+
+This succeeds for most consumer NAT configurations (full cone, restricted cone, port-restricted cone).
+
+### Layer 2 — Relay through peers
+
+When hole punching fails, messages can be relayed through a mutually-reachable peer. A `RELAY` envelope wraps an inner envelope with a target pubkey. When a peer receives a RELAY:
+
+- If the target is itself, it unwraps and processes the inner envelope
+- If the target is a directly connected peer, it forwards the inner envelope
+- Otherwise, it drops the message (single-hop only — no multi-hop to prevent amplification)
+
+This is free infrastructure — any well-connected node in the mesh acts as a natural relay.
+
+### Layer 3 — Bootstrap as relay of last resort
+
+If a node has no direct peers (just started, behind aggressive NAT, hole punching failed), the bootstrap server relays `NEW_MESSAGE` and `SYNC_*` envelopes between connected nodes sharing a `server_id`. This uses the persistent bootstrap connection from Layer 1.
+
+Bootstrap relay is a degraded mode — as soon as a direct or hole-punched connection succeeds, the node stops routing through bootstrap.
+
+### Connection lifecycle
+
+```
+Node B wants to reach Node A:
+
+1. Try direct TCP connect
+   ✓ → HELLO handshake → done
+   ✗ ↓
+
+2. Ask bootstrap for A's public address, attempt hole punch
+   ✓ → HELLO handshake → done
+   ✗ ↓
+
+3. Send messages via RELAY through any mutual peer
+   ✓ → messages flow, no direct connection needed
+   ✗ ↓
+
+4. Route through bootstrap's persistent connection
+   ✓ → degraded mode, but functional
+```
+
+This is exposed through a single method: `PeerNetwork.ensure_reachability()`. Peers that can only be reached via relay are tracked and automatically upgraded to direct connections when possible.
+
+### What you don't need
+
+- **STUN/TURN servers** — the bootstrap fills both roles (address discovery + relay)
+- **UDP** — TCP simultaneous open keeps the protocol uniform
+- **ICE negotiation** — the three-layer fallback is simpler and deterministic
+- **UPnP/PMP** — unreliable in practice and adds platform-specific complexity
 
 ## Dependencies
 
@@ -163,11 +233,10 @@ pip install pytest
 python -m pytest tests/ -v
 ```
 
-32 tests covering identity, message model, SQLite store, wire protocol, consensus validation, and multi-node integration (gossip propagation, 3-node relay, sync-on-connect).
+43 tests covering identity, message model, SQLite store, wire protocol, consensus validation, multi-node integration (gossip propagation, 3-node relay, sync-on-connect), and NAT traversal (hole-punch coordination, peer relay, bootstrap relay, ensure_reachability).
 
 ## Limitations
 
-- **No NAT traversal** — nodes need direct connectivity (same LAN or port-forwarded). UDP hole punching is out of scope.
 - **No encryption in transit** — messages are signed but not encrypted on the wire. For production use, wrap connections in TLS.
 - **No access control** — anyone who knows a server ID can join. This is by design for censorship resistance, but means servers are public.
 - **Full replication** — every node stores the complete history. Fine for chat-scale data, not for file sharing.
