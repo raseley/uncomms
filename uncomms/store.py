@@ -21,7 +21,8 @@ CREATE TABLE IF NOT EXISTS messages (
     timestamp   REAL NOT NULL,
     prev_hash   TEXT NOT NULL,
     signature   TEXT NOT NULL,
-    received_at REAL NOT NULL
+    received_at REAL NOT NULL,
+    encrypted   INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_msg_chan
@@ -61,6 +62,18 @@ class MessageStore:
         self._conn.executescript(_SCHEMA)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Apply schema migrations for existing databases."""
+        # Add encrypted column if missing (migration from pre-encryption schema)
+        cur = self._conn.execute("PRAGMA table_info(messages)")
+        columns = {row["name"] for row in cur.fetchall()}
+        if "encrypted" not in columns:
+            self._conn.execute(
+                "ALTER TABLE messages ADD COLUMN encrypted INTEGER NOT NULL DEFAULT 0"
+            )
+            self._conn.commit()
 
     def close(self) -> None:
         if self._conn:
@@ -74,6 +87,11 @@ class MessageStore:
         return await loop.run_in_executor(None, partial(fn, *args))
 
     def _row_to_message(self, row: sqlite3.Row) -> Message:
+        # Handle both old schema (no encrypted column) and new
+        try:
+            encrypted = bool(row["encrypted"])
+        except (IndexError, KeyError):
+            encrypted = False
         return Message(
             id=row["id"],
             server_id=row["server_id"],
@@ -84,6 +102,7 @@ class MessageStore:
             timestamp=row["timestamp"],
             prev_hash=row["prev_hash"],
             signature=bytes.fromhex(row["signature"]),
+            encrypted=encrypted,
         )
 
     # -- messages --------------------------------------------------------------
@@ -91,7 +110,7 @@ class MessageStore:
     def _add_message_sync(self, msg: Message) -> bool:
         try:
             self._conn.execute(
-                "INSERT INTO messages VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO messages VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     msg.id,
                     msg.server_id,
@@ -103,6 +122,7 @@ class MessageStore:
                     msg.prev_hash,
                     msg.signature.hex(),
                     time.time(),
+                    int(msg.encrypted),
                 ),
             )
             self._conn.commit()

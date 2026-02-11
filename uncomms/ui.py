@@ -137,13 +137,20 @@ class ChatUI:
             me = f"You: {self.node.identity.display_name} ({self.node.identity.fingerprint})"
             self._addstr(y, 1, me[:sw-2], curses.color_pair(2))
 
+    def _get_server_key(self) -> bytes | None:
+        """Get the server key for the current server, if available."""
+        if not self.current_server or not self.node.keyring:
+            return None
+        return self.node.keyring.get_key(self.current_server)
+
     def _draw_header(self, h: int, w: int) -> None:
         x_start = self.SIDEBAR_WIDTH + 1
         available = w - x_start - 1
 
         if self.current_server and self.current_server in self.node.server_mgr.servers:
             srv = self.node.server_mgr.servers[self.current_server]
-            header = f" #{self.current_channel} @ {srv.name}"
+            lock = " [E2E]" if srv.server_key else ""
+            header = f" #{self.current_channel} @ {srv.name}{lock}"
             port_info = ""
             if self.node.network:
                 port_info = f" | port:{self.node.network.actual_port}"
@@ -167,6 +174,7 @@ class ChatUI:
 
         lines: list[tuple[str, int]] = []  # (text, color_pair)
         own_pk = self.node.identity.pubkey_hex if self.node.identity else ""
+        server_key = self._get_server_key()
 
         for msg in self.messages:
             ts = datetime.fromtimestamp(msg.timestamp).strftime("%H:%M")
@@ -174,8 +182,12 @@ class ChatUI:
             is_me = msg.author_pubkey.hex() == own_pk
             color = 2 if is_me else 0
 
-            prefix = f"[{ts}] {msg.author_name} ({fp}): "
-            text = prefix + msg.content
+            # Decrypt content for display if encrypted
+            display_content = msg.get_display_content(server_key)
+            lock_indicator = "[E] " if msg.encrypted else ""
+
+            prefix = f"[{ts}] {lock_indicator}{msg.author_name} ({fp}): "
+            text = prefix + display_content
 
             # Word wrap
             while len(text) > msg_width:
