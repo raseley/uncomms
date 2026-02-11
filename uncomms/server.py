@@ -6,8 +6,12 @@ import hashlib
 import time
 from dataclasses import dataclass, field
 
+from nacl.utils import random
+
 from .identity import Identity
 from .store import MessageStore
+
+SERVER_KEY_SIZE = 32  # 256-bit symmetric key
 
 
 @dataclass
@@ -18,6 +22,7 @@ class Server:
     members: dict[str, str] = field(default_factory=dict)  # pubkey_hex -> display_name
     creator_pubkey: str = ""
     created_at: float = 0.0
+    server_key: bytes | None = None  # 32-byte symmetric key for message encryption
 
 
 class ServerManager:
@@ -36,6 +41,7 @@ class ServerManager:
             members={self.identity.pubkey_hex: self.identity.display_name},
             creator_pubkey=self.identity.pubkey_hex,
             created_at=time.time(),
+            server_key=random(SERVER_KEY_SIZE),
         )
         self.servers[server_id] = srv
         return srv

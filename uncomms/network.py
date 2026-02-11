@@ -7,13 +7,19 @@ import logging
 import time
 from dataclasses import dataclass, field
 
+from nacl.public import PrivateKey, PublicKey
+
 from .identity import Identity
 from .message import Message
 from .protocol import (
+    EncryptedChannel,
     Envelope,
     MsgType,
+    derive_transport_keys,
     read_envelope,
+    read_encrypted_envelope,
     write_envelope,
+    write_encrypted_envelope,
 )
 from .store import MessageStore
 
@@ -35,12 +41,16 @@ class PeerConnection:
     port: int = 0  # their listening port
     server_ids: list[str] = field(default_factory=list)
     connected: bool = True
+    encrypted_channel: EncryptedChannel | None = None
 
     async def send(self, envelope: Envelope) -> bool:
         if not self.connected:
             return False
         try:
-            await write_envelope(self.writer, envelope)
+            if self.encrypted_channel:
+                await write_encrypted_envelope(self.encrypted_channel, envelope)
+            else:
+                await write_envelope(self.writer, envelope)
             return True
         except Exception:
             self.connected = False
@@ -63,6 +73,7 @@ class PeerNetwork:
         store: MessageStore,
         on_message=None,
         on_peer_update=None,
+        on_key_exchange=None,
     ) -> None:
         self.identity = identity
         self.host = host
@@ -70,6 +81,7 @@ class PeerNetwork:
         self.store = store
         self.on_message = on_message  # async callback(Message)
         self.on_peer_update = on_peer_update  # async callback()
+        self.on_key_exchange = on_key_exchange  # async callback(Envelope, PeerConnection)
         self.peers: dict[str, PeerConnection] = {}  # pubkey_hex -> connection
         self._server: asyncio.Server | None = None
         self._seen_ids: set[str] = set()  # message IDs we've already processed
@@ -119,13 +131,18 @@ class PeerNetwork:
             log.debug("Failed to connect to %s:%d: %s", host, port, exc)
             return False
 
-        # Send HELLO
+        # Generate ephemeral key for transport encryption
+        eph_sk = PrivateKey.generate()
+        eph_pk = eph_sk.public_key
+
+        # Send HELLO with ephemeral public key
         hello = Envelope(
             msg_type=MsgType.HELLO,
             payload={
                 "display_name": self.identity.display_name,
                 "listen_port": self.actual_port,
                 "server_ids": self.server_ids,
+                "ephemeral_pk": bytes(eph_pk).hex(),
             },
             sender_pubkey=self.identity.pubkey_hex,
         )
@@ -141,6 +158,18 @@ class PeerNetwork:
             writer.close()
             return False
 
+        # Derive transport encryption keys from ephemeral exchange
+        encrypted_channel = None
+        peer_eph_hex = ack.payload.get("ephemeral_pk", "")
+        if peer_eph_hex:
+            peer_eph_pk = PublicKey(bytes.fromhex(peer_eph_hex))
+            send_key, recv_key = derive_transport_keys(
+                eph_sk, peer_eph_pk,
+                self.identity.public_key, bytes.fromhex(ack.sender_pubkey),
+            )
+            encrypted_channel = EncryptedChannel(reader, writer, send_key, recv_key)
+            log.debug("Transport encryption established (outbound)")
+
         peer = PeerConnection(
             reader=reader,
             writer=writer,
@@ -149,6 +178,7 @@ class PeerNetwork:
             host=host,
             port=port,
             server_ids=ack.payload.get("server_ids", []),
+            encrypted_channel=encrypted_channel,
         )
 
         if peer.pubkey == self.identity.pubkey_hex:
@@ -162,7 +192,8 @@ class PeerNetwork:
         self.peers[peer.pubkey] = peer
         # No longer relay-only if we got a direct connection
         self._relay_only_peers.discard(peer.pubkey)
-        log.info("Connected to %s (%s)", peer.display_name, peer.pubkey[:8])
+        log.info("Connected to %s (%s)%s", peer.display_name, peer.pubkey[:8],
+                 " [encrypted]" if encrypted_channel else "")
 
         if self.on_peer_update:
             asyncio.ensure_future(self.on_peer_update())
@@ -193,18 +224,13 @@ class PeerNetwork:
             writer.close()
             return
 
-        peer_addr = writer.get_extra_info("peername")
-        peer = PeerConnection(
-            reader=reader,
-            writer=writer,
-            pubkey=peer_pubkey,
-            display_name=env.payload.get("display_name", ""),
-            host=peer_addr[0] if peer_addr else "",
-            port=env.payload.get("listen_port", 0),
-            server_ids=env.payload.get("server_ids", []),
-        )
+        # Generate ephemeral key for transport encryption
+        eph_sk = PrivateKey.generate()
+        eph_pk = eph_sk.public_key
 
-        # Send HELLO_ACK with our peer list
+        peer_addr = writer.get_extra_info("peername")
+
+        # Send HELLO_ACK with our peer list and ephemeral key
         known = [
             {"host": p.host, "port": p.port, "pubkey": p.pubkey}
             for p in self.peers.values()
@@ -217,6 +243,7 @@ class PeerNetwork:
                 "listen_port": self.actual_port,
                 "server_ids": self.server_ids,
                 "peers": known,
+                "ephemeral_pk": bytes(eph_pk).hex(),
             },
             sender_pubkey=self.identity.pubkey_hex,
         )
@@ -226,14 +253,38 @@ class PeerNetwork:
             writer.close()
             return
 
-        if peer.pubkey in self.peers:
+        if peer_pubkey in self.peers:
             # Already connected — close duplicate
             writer.close()
             return
 
+        # Derive transport encryption keys
+        encrypted_channel = None
+        peer_eph_hex = env.payload.get("ephemeral_pk", "")
+        if peer_eph_hex:
+            peer_eph_pk = PublicKey(bytes.fromhex(peer_eph_hex))
+            send_key, recv_key = derive_transport_keys(
+                eph_sk, peer_eph_pk,
+                self.identity.public_key, bytes.fromhex(peer_pubkey),
+            )
+            encrypted_channel = EncryptedChannel(reader, writer, send_key, recv_key)
+            log.debug("Transport encryption established (inbound)")
+
+        peer = PeerConnection(
+            reader=reader,
+            writer=writer,
+            pubkey=peer_pubkey,
+            display_name=env.payload.get("display_name", ""),
+            host=peer_addr[0] if peer_addr else "",
+            port=env.payload.get("listen_port", 0),
+            server_ids=env.payload.get("server_ids", []),
+            encrypted_channel=encrypted_channel,
+        )
+
         self.peers[peer.pubkey] = peer
         self._relay_only_peers.discard(peer.pubkey)
-        log.info("Inbound peer: %s (%s)", peer.display_name, peer.pubkey[:8])
+        log.info("Inbound peer: %s (%s)%s", peer.display_name, peer.pubkey[:8],
+                 " [encrypted]" if encrypted_channel else "")
 
         if self.on_peer_update:
             asyncio.ensure_future(self.on_peer_update())
@@ -245,7 +296,10 @@ class PeerNetwork:
 
     async def _read_loop(self, peer: PeerConnection) -> None:
         while peer.connected:
-            env = await read_envelope(peer.reader)
+            if peer.encrypted_channel:
+                env = await read_encrypted_envelope(peer.encrypted_channel)
+            else:
+                env = await read_envelope(peer.reader)
             if env is None:
                 break
             try:
@@ -273,6 +327,9 @@ class PeerNetwork:
             await self._handle_server_info(env, sender)
         elif env.msg_type == MsgType.RELAY:
             await self._handle_relay(env, sender)
+        elif env.msg_type == MsgType.KEY_EXCHANGE:
+            if self.on_key_exchange:
+                await self.on_key_exchange(env, sender)
 
     # -- gossip ----------------------------------------------------------------
 

@@ -7,6 +7,8 @@ import struct
 import time
 from dataclasses import dataclass
 
+from nacl.secret import SecretBox
+
 from .identity import Identity
 
 GENESIS_HASH = "0" * 64
@@ -28,6 +30,7 @@ class Message:
     timestamp: float
     prev_hash: str  # hash of the previous message in this channel
     signature: bytes  # 64-byte Ed25519 signature
+    encrypted: bool = False  # metadata flag (not in canonical bytes or hash)
 
     # -- canonical form --------------------------------------------------------
 
@@ -35,6 +38,7 @@ class Message:
         """Deterministic byte representation used for hashing and signing.
 
         Fields are length-prefixed to prevent ambiguity.
+        The `encrypted` flag is NOT included — it's metadata only.
         """
         return b"".join(
             [
@@ -68,28 +72,68 @@ class Message:
         content: str,
         prev_hash: str,
         timestamp: float | None = None,
+        server_key: bytes | None = None,
     ) -> Message:
+        """Create a new signed message.
+
+        If *server_key* is provided, the content is encrypted before
+        signing — the hashchain covers ciphertext.
+        """
         ts = timestamp if timestamp is not None else time.time()
+
+        encrypted = False
+        final_content = content
+        if server_key is not None:
+            box = SecretBox(server_key)
+            ct = box.encrypt(content.encode())
+            final_content = ct.hex()
+            encrypted = True
+
         msg = cls(
             id="",  # computed below
             server_id=server_id,
             channel=channel,
             author_pubkey=identity.public_key,
             author_name=identity.display_name,
-            content=content,
+            content=final_content,
             timestamp=ts,
             prev_hash=prev_hash,
             signature=b"",  # computed below
+            encrypted=encrypted,
         )
         canonical = msg.canonical_bytes()
         msg.signature = identity.sign(canonical)
         msg.id = cls.compute_hash(canonical)
         return msg
 
+    # -- encryption helpers ----------------------------------------------------
+
+    def decrypt_content(self, server_key: bytes) -> str:
+        """Decrypt the content field using the server key.
+
+        Returns the plaintext string. Raises on failure.
+        """
+        ct = bytes.fromhex(self.content)
+        box = SecretBox(server_key)
+        return box.decrypt(ct).decode()
+
+    def get_display_content(self, server_key: bytes | None = None) -> str:
+        """Return content suitable for display.
+
+        If encrypted and key is available, decrypt. Otherwise return
+        the raw content (ciphertext hex for encrypted messages without key).
+        """
+        if self.encrypted and server_key is not None:
+            try:
+                return self.decrypt_content(server_key)
+            except Exception:
+                return "[decryption failed]"
+        return self.content
+
     # -- serialization ---------------------------------------------------------
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "id": self.id,
             "server_id": self.server_id,
             "channel": self.channel,
@@ -100,6 +144,9 @@ class Message:
             "prev_hash": self.prev_hash,
             "signature": self.signature.hex(),
         }
+        if self.encrypted:
+            d["encrypted"] = True
+        return d
 
     @classmethod
     def from_dict(cls, d: dict) -> Message:
@@ -113,4 +160,5 @@ class Message:
             timestamp=d["timestamp"],
             prev_hash=d["prev_hash"],
             signature=bytes.fromhex(d["signature"]),
+            encrypted=d.get("encrypted", False),
         )

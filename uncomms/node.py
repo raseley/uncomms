@@ -8,9 +8,10 @@ import queue
 
 from .config import Config
 from .consensus import ChainValidator
-from .identity import Identity
+from .identity import Identity, Keyring
 from .message import Message, GENESIS_HASH
-from .network import PeerNetwork
+from .network import PeerNetwork, PeerConnection
+from .protocol import Envelope, MsgType, read_envelope, write_envelope
 from .server import Server, ServerManager
 from .store import MessageStore
 
@@ -25,8 +26,13 @@ class Node:
         self.network: PeerNetwork | None = None
         self.validator: ChainValidator | None = None
         self.server_mgr: ServerManager | None = None
+        self.keyring: Keyring | None = None
         self.ui_queue: queue.Queue = queue.Queue()  # async -> UI updates
         self._loop: asyncio.AbstractEventLoop | None = None
+
+    @property
+    def keyring_path(self):
+        return self.config.data_dir / "keyring.enc"
 
     # -- lifecycle -------------------------------------------------------------
 
@@ -44,6 +50,10 @@ class Node:
             self.identity.save(self.config.identity_path)
             log.info("Generated new identity: %s (%s)", self.identity.display_name, self.identity.fingerprint)
 
+        # Keyring
+        self.keyring = Keyring(self.identity)
+        self.keyring.load(self.keyring_path)
+
         # Store
         self.store = MessageStore(self.config.db_path)
         self.store.open()
@@ -55,6 +65,12 @@ class Node:
         self.server_mgr = ServerManager(self.store, self.identity)
         await self.server_mgr.load_servers()
 
+        # Restore server keys from keyring into Server objects
+        for sid, srv in self.server_mgr.servers.items():
+            key = self.keyring.get_key(sid)
+            if key is not None:
+                srv.server_key = key
+
         # Network
         self.network = PeerNetwork(
             identity=self.identity,
@@ -63,6 +79,7 @@ class Node:
             store=self.store,
             on_message=self._on_peer_message,
             on_peer_update=self._on_peer_update,
+            on_key_exchange=self._on_key_exchange,
         )
         self.network.server_ids = list(self.server_mgr.servers.keys())
         await self.network.start()
@@ -76,6 +93,9 @@ class Node:
             asyncio.ensure_future(self._bootstrap_loop())
 
     async def shutdown(self) -> None:
+        # Persist keyring before closing
+        if self.keyring:
+            self.keyring.save(self.keyring_path)
         if self.network:
             await self.network.stop()
         if self.store:
@@ -87,12 +107,16 @@ class Node:
         head = await self.store.get_chain_head(server_id, channel)
         prev_hash = head if head else GENESIS_HASH
 
+        # Encrypt with server key if available
+        server_key = self.keyring.get_key(server_id) if self.keyring else None
+
         msg = Message.create(
             identity=self.identity,
             server_id=server_id,
             channel=channel,
             content=content,
             prev_hash=prev_hash,
+            server_key=server_key,
         )
 
         await self.store.add_message(msg)
@@ -115,11 +139,40 @@ class Node:
     async def _on_peer_update(self) -> None:
         self.ui_queue.put(("peer_update", None))
 
+    async def _on_key_exchange(self, env: Envelope, sender: PeerConnection) -> None:
+        """Handle incoming KEY_EXCHANGE: decrypt and store the server key."""
+        server_id = env.payload.get("server_id", "")
+        sealed_hex = env.payload.get("sealed_key", "")
+        if not server_id or not sealed_hex:
+            return
+
+        try:
+            sealed_key = bytes.fromhex(sealed_hex)
+            peer_pubkey = bytes.fromhex(sender.pubkey)
+            server_key = self.keyring.decrypt_key_from_peer(sealed_key, peer_pubkey)
+            self.keyring.set_key(server_id, server_key)
+            self.keyring.save(self.keyring_path)
+
+            # Update server object
+            srv = self.server_mgr.get_server(server_id)
+            if srv:
+                srv.server_key = server_key
+
+            log.info("Received server key for %s from %s", server_id[:8], sender.pubkey[:8])
+        except Exception as exc:
+            log.warning("Failed to decrypt server key from %s: %s", sender.pubkey[:8], exc)
+
     # -- server management -----------------------------------------------------
 
     async def create_server(self, name: str) -> Server:
         srv = self.server_mgr.create_server(name)
         await self.server_mgr.persist_server(srv)
+
+        # Store the server key in keyring
+        if srv.server_key and self.keyring:
+            self.keyring.set_key(srv.id, srv.server_key)
+            self.keyring.save(self.keyring_path)
+
         self.network.server_ids = list(self.server_mgr.servers.keys())
         self.ui_queue.put(("server_update", srv))
         return srv
@@ -136,6 +189,28 @@ class Node:
             self.ui_queue.put(("server_update", None))
         return ok
 
+    async def send_key_exchange(self, peer_pubkey: str, server_id: str) -> bool:
+        """Send the server key to a peer via KEY_EXCHANGE message."""
+        if not self.keyring:
+            return False
+        peer_pk_bytes = bytes.fromhex(peer_pubkey)
+        sealed = self.keyring.encrypt_key_for_peer(server_id, peer_pk_bytes)
+        if sealed is None:
+            return False
+
+        env = Envelope(
+            msg_type=MsgType.KEY_EXCHANGE,
+            payload={
+                "server_id": server_id,
+                "sealed_key": sealed.hex(),
+            },
+            sender_pubkey=self.identity.pubkey_hex,
+        )
+        peer = self.network.peers.get(peer_pubkey)
+        if peer and peer.connected:
+            return await peer.send(env)
+        return False
+
     def create_channel(self, server_id: str, channel_name: str) -> bool:
         ok = self.server_mgr.add_channel(server_id, channel_name)
         if ok:
@@ -145,8 +220,6 @@ class Node:
     # -- bootstrap -------------------------------------------------------------
 
     async def _bootstrap_loop(self) -> None:
-        from .protocol import Envelope, MsgType, read_envelope, write_envelope
-
         parts = self.config.bootstrap.rpartition(":")
         bs_host = parts[0] or "127.0.0.1"
         bs_port = int(parts[2])
@@ -168,8 +241,6 @@ class Node:
 
         Handles REGISTER, DISCOVER, and incoming PUNCH_NOTIFY/relay messages.
         """
-        from .protocol import Envelope, MsgType, read_envelope, write_envelope
-
         reader, writer = await asyncio.open_connection(bs_host, bs_port)
 
         # First message must be REGISTER to establish persistent connection
@@ -251,8 +322,6 @@ class Node:
     ) -> None:
         """Read messages pushed by the bootstrap server (PUNCH_NOTIFY,
         DISCOVER_RESPONSE, relayed messages)."""
-        from .protocol import Envelope, MsgType, read_envelope
-
         while True:
             env = await read_envelope(reader)
             if env is None:
@@ -275,9 +344,6 @@ class Node:
 
             elif env.msg_type == MsgType.NEW_MESSAGE:
                 # Relayed message from bootstrap — process like a peer message
-                # Create a dummy sender for the handler
-                from .network import PeerConnection
-                import io
                 dummy = PeerConnection(
                     reader=asyncio.StreamReader(),
                     writer=None,  # type: ignore[arg-type]
@@ -286,7 +352,6 @@ class Node:
                 await self.network._handle_new_message(env, dummy)
 
             elif env.msg_type == MsgType.SYNC_RESPONSE:
-                from .network import PeerConnection
                 dummy = PeerConnection(
                     reader=asyncio.StreamReader(),
                     writer=None,  # type: ignore[arg-type]
